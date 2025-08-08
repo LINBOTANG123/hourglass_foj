@@ -21,6 +21,7 @@ from torch import optim
 from torch.utils import data, flop_counter
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
+import pdb
 
 import k_diffusion as K
 
@@ -198,6 +199,7 @@ def main():
         transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(size[0]),
         K.augmentation.KarrasAugmentationPipeline(model_config['augment_prob'], disable_all=model_config['augment_prob'] == 0),
+        # transforms.ToTensor(),
     ])
 
     if dataset_config['type'] == 'imagefolder':
@@ -218,9 +220,31 @@ def main():
         spec = importlib.util.spec_from_file_location('custom_dataset', location)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        get_dataset = getattr(module, dataset_config.get('get_dataset', 'get_dataset'))
+        get_dataset = getattr(module, dataset_config.get('get_dataset', 'FoJDataset'))
         custom_dataset_config = dataset_config.get('config', {})
-        train_set = get_dataset(custom_dataset_config, transform=tf)
+
+        # 1) Instantiate without transform arg
+        train_set = get_dataset(**custom_dataset_config)
+
+        # 2) If your class supports a .transform attribute, set it:
+        # if hasattr(train_set, 'transform'):
+        #     print("transform here!!!")
+        #     train_set.transform = tf
+        # else:
+        #     # Otherwise wrap it in a simple proxy that applies tf to each sample:
+        #     class WrappedDataset(torch.utils.data.Dataset):
+        #         def __init__(self, ds, transform):
+        #             self.ds = ds
+        #             self.tf = transform
+        #         def __len__(self):
+        #             return len(self.ds)
+        #         def __getitem__(self, i):
+        #             img, *rest = self.ds[i]
+        #             img = self.tf(img)
+        #             return (img, *rest)
+
+        #     train_set = WrappedDataset(train_set, tf)
+
     else:
         raise ValueError('Invalid dataset type')
 
@@ -240,15 +264,31 @@ def main():
 
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
 
+
     with torch.no_grad(), K.models.flops.flop_counter() as fc:
-        x = torch.zeros([1, model_config['input_channels'], size[0], size[1]], device=device)
+        x     = torch.zeros([1, model_config['input_channels'], *size],
+                            device=device)
         sigma = torch.ones([1], device=device)
-        extra_args = {}
+        extra = {}
+
         if getattr(unwrap(inner_model), "num_classes", 0):
-            extra_args['class_cond'] = torch.zeros([1], dtype=torch.long, device=device)
-        inner_model(x, sigma, **extra_args)
+            extra["class_cond"] = torch.zeros([1], dtype=torch.long,
+                                            device=device)
+
+        # ---------- choose the right dummy aug_cond ----------
+        if hasattr(unwrap(inner_model), "image_encoder"):
+            # FoJ-conditional model → needs an image tensor
+            cond_ch = model_config.get("cond_channels", 3)
+            extra["aug_cond"] = torch.zeros([1, cond_ch, *size], device=device)
+        else:
+            # Vanilla K-Diffusion models → 9-dim augmentation vector
+            extra["aug_cond"] = torch.zeros([1, 9], device=device)
+        # ------------------------------------------------------
+
+        inner_model(x, sigma, **extra)
         if accelerator.is_main_process:
-            print(f"Forward pass GFLOPs: {fc.flops / 1_000_000_000:,.3f}", flush=True)
+            print(f"Forward pass GFLOPs: {fc.flops/1e9:,.3f}")
+
 
     if use_wandb:
         wandb.watch(inner_model)
@@ -347,27 +387,124 @@ def main():
     @K.utils.eval_mode(model_ema)
     def demo():
         if accelerator.is_main_process:
-            tqdm.write('Sampling...')
-        filename = f'{args.name}_demo_{step:08}.png'
+            tqdm.write("Sampling…")
+
+        filename = f"{args.name}_demo_{step:08}.png"
+
+        # ───────────────────────────────────────────────────────────
+        # 1. Allocate latent noise  x  exactly as before
+        # ───────────────────────────────────────────────────────────
         n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
-        x = torch.randn([accelerator.num_processes, n_per_proc, model_config['input_channels'], size[0], size[1]], generator=demo_gen).to(device)
+
+        x = torch.randn(
+                [accelerator.num_processes, n_per_proc,
+                model_config["input_channels"], size[0], size[1]],
+                generator=demo_gen
+            ).to(device)                                    # ← on GPU
         dist.broadcast(x, 0)
         x = x[accelerator.process_index] * sigma_max
-        model_fn, extra_args = model_ema, {}
-        if num_classes:
-            class_cond = torch.randint(0, num_classes, [accelerator.num_processes, n_per_proc], generator=demo_gen).to(device)
-            dist.broadcast(class_cond, 0)
-            extra_args['class_cond'] = class_cond[accelerator.process_index]
-            model_fn = make_cfg_model_fn(model_ema)
-        sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
-        x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=not accelerator.is_main_process)
-        x_0 = accelerator.gather(x_0)[:args.sample_n]
-        if accelerator.is_main_process:
-            grid = utils.make_grid(x_0, nrow=math.ceil(args.sample_n ** 0.5), padding=0)
-            K.utils.to_pil_image(grid).save(filename)
-            if use_wandb:
-                wandb.log({'demo_grid': wandb.Image(filename)}, step=step)
 
+        # ───────────────────────────────────────────────────────────
+        # 2. Build   extra_args   for the FoJ model
+        #    • we still support class_cond, cfg, etc.
+        #    • BUT we *add* an RGB conditioning image tensor
+        # ───────────────────────────────────────────────────────────
+        model_fn, extra_args = model_ema, {}
+
+        # 2-a class-conditioning (unchanged)
+        if num_classes:
+            class_cond = torch.randint(
+                0, num_classes,
+                [accelerator.num_processes, n_per_proc],
+                generator=demo_gen, device=device)
+            dist.broadcast(class_cond, 0)
+            extra_args["class_cond"] = class_cond[accelerator.process_index]
+            model_fn = make_cfg_model_fn(model_ema)
+
+        def extract_rgb(sample):
+            """
+            Returns a 3×H×W RGB tensor from a dataset element.
+
+            Handles either:
+            • (payload, label)
+            • payload
+            where payload ≡ (foj_t, aug_vec_9, img_tensor)
+            """
+            # If we got the outer (payload, label) tuple, strip the label first
+            if isinstance(sample, (tuple, list)) and len(sample) == 2 and torch.is_tensor(sample[1]):
+                sample = sample[0]
+
+            last = sample[-1]
+            if isinstance(last, torch.Tensor) and last.dim() == 3 and last.size(0) == 3:
+                return last
+
+            if isinstance(last, (tuple, list)):
+                for x in last:
+                    if isinstance(x, torch.Tensor) and x.dim() == 3 and x.size(0) == 3:
+                        return x
+
+            raise RuntimeError("No 3-channel image found in sample")
+
+
+        if accelerator.is_main_process:
+            gen  = torch.Generator().manual_seed(step)           # deterministic
+            # pdb.set_trace()
+            idxs = torch.randint(0, len(train_set),
+                                (n_per_proc,), generator=gen).tolist()
+
+            cond_rank0 = torch.stack([extract_rgb(train_set[i]) for i in idxs])
+                                                            # [n, 3, H, W]
+        else:
+            cond_rank0 = torch.empty(
+                [n_per_proc, 3, *size], dtype=torch.float32, device=device)
+
+        # move to GPU + dtype fix + normalise
+        cond_rank0 = cond_rank0.to(device, dtype=torch.float32)
+        if cond_rank0.max() > 1:                # dataset might be 0-255
+            cond_rank0.div_(255.)
+
+        dist.broadcast(cond_rank0, 0)
+
+        extra_args = {"aug_cond": cond_rank0}
+
+        # ───────────────────────────────────────────────────────────
+        # 3. Sample with K-Diffusion’s DPMPP-2M-SDE solver
+        # ───────────────────────────────────────────────────────────
+        sigmas = K.sampling.get_sigmas_karras(
+                    50, sigma_min, sigma_max, rho=7., device=device)
+
+        x_0 = K.sampling.sample_dpmpp_2m_sde(
+                model_fn, x, sigmas,
+                extra_args=extra_args,
+                eta=0.0, solver_type="heun",
+                disable=not accelerator.is_main_process)
+
+        # gather tensors to rank-0
+        x_0       = accelerator.gather(x_0)[:args.sample_n]      # (N,7,H,W)
+        cond_imgs = accelerator.gather(cond_rank0)[:args.sample_n]  # (N,3,H,W)
+
+        if accelerator.is_main_process:
+            import numpy as np
+            from PIL import Image
+            import os
+
+            out_dir = f"{args.name}_demo"               # e.g. foj_diffusion_memfit_demo
+            os.makedirs(out_dir, exist_ok=True)
+
+            H, W = x_0.shape[2:]
+
+            for k in range(x_0.size(0)):
+                # 1. save predicted FoJ field  (7,H,W) → (H,W,7)
+                foj_np = x_0[k].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                np.save(os.path.join(
+                    out_dir, f"{args.name}_step{step:08}_sample{k:02}_field.npy"),
+                    foj_np)
+
+                # 2. save conditioning RGB image  (3,H,W) → PNG in [0,255]
+                img_np = (cond_imgs[k].cpu().clamp(0,1).permute(1, 2, 0) * 255).byte().numpy()
+                Image.fromarray(img_np).save(os.path.join(
+                    out_dir, f"{args.name}_step{step:08}_sample{k:02}_img.png"))
+                
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
     def evaluate():
@@ -442,6 +579,7 @@ def main():
                     start_timer = time.time()
 
                 with accelerator.accumulate(model):
+                    # pdb.set_trace()
                     reals, _, aug_cond = batch[image_key]
                     class_cond, extra_args = None, {}
                     if num_classes:

@@ -9,3 +9,5 @@ wandb/*
 *.csv
 .env
 *.safetensors
+/foj_diffusion_memfit_demo/
+/logs/

@@ -232,8 +232,6 @@ def make_model(config):
                     self_attn.get('d_head', 64),
                     self_attn.get('kernel_size', 7),
                 )
-            elif self_attn['type'] == 'shifted-window':
-                attn_spec = models.image_transformer_v2.ShiftedWindowAttentionSpec(self_attn.get('d_head', 64), self_attn['window_size'])
             else:
                 raise ValueError(f"unsupported self attention type {self_attn['type']}")
             levels.append(

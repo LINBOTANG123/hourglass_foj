@@ -1,0 +1,53 @@
+{
+  "model": {
+    "type":           "foj_cond_transformer_v2",
+
+    "input_channels": 7,
+    "output_channels": 7,
+    "cond_channels": 3, 
+    "input_size":   [128, 128],
+    "patch_size":   [4, 4], 
+
+    "depths":  [2, 2, 4],
+    "widths":  [128, 256, 512],
+    "self_attns": [
+      { "type": "shifted-window", "d_head": 32, "window_size": 8 },
+      { "type": "shifted-window", "d_head": 64, "window_size": 8 },
+      { "type": "global",         "d_head": 64 }
+    ],
+
+    "mapping_cond_dim": 128,
+
+    "loss_config":    "karras",
+    "loss_weighting": "soft-min-snr",
+    "dropout_rate":   [0.0, 0.0, 0.1],
+    "mapping_dropout_rate": 0.0,
+    "augment_prob":   0.0,
+    "sigma_data":     1.0,
+    "sigma_min":      0.01,
+    "sigma_max":      160,
+    "sigma_sample_density": { "type": "cosine-interpolated" }
+  },
+
+  "dataset": {
+    "type":        "custom",
+    "location":    "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/k-diffusion/k_diffusion/datasets_custom.py",
+    "get_dataset": "FoJDataset",
+    "config": {
+      "root": "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/generated_shapes_10k",
+      "size": 128 
+    },
+    "image_key": 0 
+  },
+
+  "optimizer": {
+    "type":  "adamw",
+    "lr":    5e-4,
+    "betas": [0.9, 0.95],
+    "eps":   1e-8,
+    "weight_decay": 1e-4
+  },
+
+  "lr_sched":  { "type": "constant", "warmup": 0.0 },
+  "ema_sched": { "type": "inverse",  "power": 0.6667, "max_value": 0.9999 }
+}

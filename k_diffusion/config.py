@@ -210,8 +210,7 @@ def make_model(config):
             mapping_cond_dim=config['mapping_cond_dim'],
         )
     elif config['type'] == 'foj_cond_transformer_v2':
-        # ─── your custom FoJ‐conditioned transformer ───────────────
-        # build the same `levels` & `mapping` specs as above
+        # ─── custom FoJ‐conditioned transformer ───────────────
         assert len(config['widths']) == len(config['depths'])
         assert len(config['widths']) == len(config['d_ffs'])
         assert len(config['widths']) == len(config['self_attns'])
@@ -224,7 +223,6 @@ def make_model(config):
             config['self_attns'],
             config['dropout_rate']
         ):
-            # reuse the same attention‐spec logic
             if self_attn['type'] == 'global':
                 attn_spec = models.image_transformer_v2.GlobalAttentionSpec(self_attn.get('d_head', 64))
             elif self_attn['type'] == 'neighborhood':

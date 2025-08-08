@@ -43,16 +43,6 @@ class FoJDataset(Dataset):
         foj_np = np.load(self.field_dir / f"{stem}_field.npy")   # H×W×C
         foj_t = torch.from_numpy(foj_np).permute(2, 0, 1).float()
 
-        _, h, w = foj_t.shape
-        if (h, w) != (self.size, self.size):
-            print("self size: ", self.size, "foj shape: ", h, w)
-            foj_t = F.interpolate(
-                foj_t[None],
-                size=self.size,
-                mode="bilinear",
-                align_corners=False
-            ).squeeze(0)
-
         # return ((foj, aug_vec_9, img), dummy_label)
         return (foj_t, aug_vec_9, img_tensor), torch.tensor(0)
 

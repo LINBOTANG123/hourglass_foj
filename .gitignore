@@ -11,3 +11,5 @@ wandb/*
 *.safetensors
 /foj_diffusion_memfit_demo/
 /logs/
+/exps_7channel/
+/foj_diffusion_one_obj_demo/

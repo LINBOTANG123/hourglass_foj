@@ -35,9 +35,9 @@
     "get_dataset": "FoJDataset",
     "config": {
       "root": "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/generated_shapes_10k",
-      "img_path": "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/generated_shapes_10k/imgs",
-      "foj_path": "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/generated_shapes_10k/fields",
-      "channels": [0, 1, 2, 3, 4, 5, 6],
+      "img_path": "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/generated_shapes_10k/imgs_one_object",
+      "foj_path": "/n/netscratch/zickler_lab/Lab/linbo/stereo_project/generated_shapes_10k/fields_one_object",
+      "channels": [0, 1],
       "size": 128 
     },
     "image_key": 0 

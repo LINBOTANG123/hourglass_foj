@@ -38,7 +38,7 @@ def main():
     plt.figure()
     plt.semilogy(iters, losses, label="loss")
     plt.semilogy(iters, avg_losses, label="avg loss")
-    plt.xlabel("Iteration (log order)")
+    plt.xlabel("Iters")
     plt.ylabel("Loss")
     plt.title("Training Loss")
     plt.legend()

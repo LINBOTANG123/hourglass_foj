@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hourglass
-#SBATCH --partition=gpu_test
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G

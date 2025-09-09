@@ -13,3 +13,6 @@ wandb/*
 /logs/
 /exps_7channel/
 /foj_diffusion_one_obj_demo/
+/foj_diffusion_one*/
+/foj_diffusion_two*/
+/exps*/

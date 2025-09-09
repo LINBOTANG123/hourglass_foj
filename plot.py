@@ -36,10 +36,11 @@ def main():
     iters, epochs, steps, losses, avg_losses = parse_log(args.logfile)
 
     plt.figure()
-    plt.semilogy(iters, losses, label="loss")
-    plt.semilogy(iters, avg_losses, label="avg loss")
+    plt.plot(iters, losses, label="loss")
+    plt.plot(iters, avg_losses, label="avg loss")
     plt.xlabel("Iters")
     plt.ylabel("Loss")
+    plt.yscale('log')
     plt.title("Training Loss")
     plt.legend()
     plt.tight_layout()

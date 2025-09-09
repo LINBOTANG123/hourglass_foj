@@ -22,6 +22,7 @@ from torch.utils import data, flop_counter
 from torchvision import datasets, transforms, utils
 from tqdm.auto import tqdm
 import pdb
+import numpy as np
 
 import k_diffusion as K
 
@@ -142,15 +143,6 @@ def main():
     if accelerator.is_main_process:
         print(f'Parameters: {K.utils.n_params(inner_model):,}')
 
-    # If logging to wandb, initialize the run
-    use_wandb = accelerator.is_main_process and args.wandb_project
-    if use_wandb:
-        import wandb
-        log_config = vars(args)
-        log_config['config'] = config
-        log_config['parameters'] = K.utils.n_params(inner_model)
-        wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
-
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
     if opt_config['type'] == 'adamw':
@@ -226,25 +218,39 @@ def main():
         # 1) Instantiate without transform arg
         train_set = get_dataset(**custom_dataset_config)
 
-        # 2) If your class supports a .transform attribute, set it:
-        # if hasattr(train_set, 'transform'):
-        #     print("transform here!!!")
-        #     train_set.transform = tf
-        # else:
-        #     # Otherwise wrap it in a simple proxy that applies tf to each sample:
-        #     class WrappedDataset(torch.utils.data.Dataset):
-        #         def __init__(self, ds, transform):
-        #             self.ds = ds
-        #             self.tf = transform
-        #         def __len__(self):
-        #             return len(self.ds)
-        #         def __getitem__(self, i):
-        #             img, *rest = self.ds[i]
-        #             img = self.tf(img)
-        #             return (img, *rest)
+        # after creating `train_set` and `get_dataset` above
+        val_cfg = dataset_config.get("val_config", None)
+        if val_cfg is not None:
+            val_set = get_dataset(**val_cfg)
+        else:
+            # fallback: small random split from train_set if no val_config provided
+            n_total = len(train_set)
+            n_val   = max(1, int(0.05 * n_total))
+            n_train = n_total - n_val
+            train_set, val_set = torch.utils.data.random_split(
+                train_set, [n_train, n_val],
+                generator=torch.Generator().manual_seed(123)
+            )
 
-        #     train_set = WrappedDataset(train_set, tf)
+        val_dl = data.DataLoader(
+            val_set,
+            args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=args.num_workers,
+            persistent_workers=True,
+            pin_memory=True
+        )
 
+    # If logging to wandb, initialize the run
+    use_wandb = accelerator.is_main_process and args.wandb_project
+    if use_wandb:
+        import wandb
+        log_config = vars(args)
+        log_config['config'] = config
+        log_config['parameters'] = K.utils.n_params(inner_model)
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
+        
     else:
         raise ValueError('Invalid dataset type')
 
@@ -262,7 +268,8 @@ def main():
     train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
 
-    inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    # inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    inner_model, inner_model_ema, opt, train_dl, val_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl, val_dl)
 
 
     with torch.no_grad(), K.models.flops.flop_counter() as fc:
@@ -349,24 +356,24 @@ def main():
         unwrap(model_ema.inner_model).load_state_dict(ckpt)
         del ckpt
 
-    evaluate_enabled = args.evaluate_every > 0 and args.evaluate_n > 0
+    evaluate_enabled = (args.evaluate_every > 0) and (val_dl is not None)
     metrics_log = None
-    if evaluate_enabled:
-        if args.evaluate_with == 'inception':
-            extractor = K.evaluation.InceptionV3FeatureExtractor(device=device)
-        elif args.evaluate_with == 'clip':
-            extractor = K.evaluation.CLIPFeatureExtractor(args.clip_model, device=device)
-        elif args.evaluate_with == 'dinov2':
-            extractor = K.evaluation.DINOv2FeatureExtractor(args.dinov2_model, device=device)
-        else:
-            raise ValueError('Invalid evaluation feature extractor')
-        train_iter = iter(train_dl)
-        if accelerator.is_main_process:
-            print('Computing features for reals...')
-        reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
-        if accelerator.is_main_process and not args.evaluate_only:
-            metrics_log = K.utils.CSVLogger(f'{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
-        del train_iter
+    # if evaluate_enabled:
+    #     if args.evaluate_with == 'inception':
+    #         extractor = K.evaluation.InceptionV3FeatureExtractor(device=device)
+    #     elif args.evaluate_with == 'clip':
+    #         extractor = K.evaluation.CLIPFeatureExtractor(args.clip_model, device=device)
+    #     elif args.evaluate_with == 'dinov2':
+    #         extractor = K.evaluation.DINOv2FeatureExtractor(args.dinov2_model, device=device)
+    #     else:
+    #         raise ValueError('Invalid evaluation feature extractor')
+    #     train_iter = iter(train_dl)
+    #     if accelerator.is_main_process:
+    #         print('Computing features for reals...')
+    #     reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
+    #     if accelerator.is_main_process and not args.evaluate_only:
+    #         metrics_log = K.utils.CSVLogger(f'{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
+    #     del train_iter
 
     cfg_scale = 1.
 
@@ -505,31 +512,76 @@ def main():
                 Image.fromarray(img_np).save(os.path.join(
                     out_dir, f"{args.name}_step{step:08}_sample{k:02}_img.png"))
                 
+    u_scale = None
+    try:
+        u_scale = config["dataset"]["val_config"].get("u_scale", None)
+    except Exception:
+        u_scale = config["dataset"].get("config", {}).get("u_scale", None)
+                    
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
     def evaluate():
         if not evaluate_enabled:
             return
         if accelerator.is_main_process:
-            tqdm.write('Evaluating...')
+            tqdm.write("Evaluating MSE on validation set...")
+
+        # 50-step sampler (reduce to 30 for speed if needed)
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
-        def sample_fn(n):
-            x = torch.randn([n, model_config['input_channels'], size[0], size[1]], device=device) * sigma_max
-            model_fn, extra_args = model_ema, {}
-            if num_classes:
-                extra_args['class_cond'] = torch.randint(0, num_classes, [n], device=device)
-                model_fn = make_cfg_model_fn(model_ema)
-            x_0 = K.sampling.sample_dpmpp_2m_sde(model_fn, x, sigmas, extra_args=extra_args, eta=0.0, solver_type='heun', disable=True)
-            return x_0
-        fakes_features = K.evaluation.compute_features(accelerator, sample_fn, extractor, args.evaluate_n, args.batch_size)
+
+        # Accumulators
+        mse_sum = 0.0
+        pix_sum = 0.0
+
+        # Where to save predictions for this eval pass
+        save_root = Path(f"{args.name}_evalpreds") / f"step_{step:08d}"
+        save_root.mkdir(parents=True, exist_ok=True) if accelerator.is_main_process else None
+
+        # Running index for filenames (per eval pass)
+        global_idx = 0
+
+        for batch in tqdm(val_dl, leave=False, disable=not accelerator.is_main_process):
+            # Dataset returns ((field, aug_vec_9, img_rgb), label)
+            reals, _, aug_cond = batch[image_key]      # reals: (N,1,H,W) in training scale; aug_cond: (N,3,H,W)
+
+            # Sample from noise with EMA model, conditioned on RGB
+            x = torch.randn_like(reals) * sigma_max
+            x_pred = K.sampling.sample_dpmpp_2m_sde(
+                model_ema, x, sigmas,
+                extra_args={"aug_cond": aug_cond},
+                eta=0.0, solver_type="heun", disable=True
+            )  # (N,1,H,W)
+
+            # ---- MSE (in the SAME scale as training targets) ----
+            se = (x_pred - reals).pow(2).sum()                          # sum, not mean
+            se = accelerator.gather(se).sum().item()                    # scalar
+            npx = accelerator.gather(torch.tensor([reals.numel()], 
+                    device=device, dtype=torch.float32)).sum().item()
+
+            mse_sum += se
+            pix_sum += npx
+
+            # ---- Save predictions as .npy on rank 0 ----
+            if accelerator.is_main_process:
+                N = x_pred.size(0)
+                for i in range(N):
+                    pred = x_pred[i, 0].detach().cpu().float().numpy()   # (H,W) in training scale
+                    # Optionally unscale to pixel units if you trained with u_scale
+                    if u_scale is not None and u_scale > 0:
+                        pred_to_save = pred * float(u_scale)
+                    else:
+                        pred_to_save = pred
+
+                    np.save(save_root / f"val_{global_idx:06d}_pred_udf.npy", pred_to_save.astype(np.float32))
+                    global_idx += 1
+
+        mse_mean = mse_sum / pix_sum
         if accelerator.is_main_process:
-            fid = K.evaluation.fid(fakes_features, reals_features)
-            kid = K.evaluation.kid(fakes_features, reals_features)
-            print(f'FID: {fid.item():g}, KID: {kid.item():g}')
-            if accelerator.is_main_process and metrics_log is not None:
-                metrics_log.write(step, elapsed, ema_stats['loss'], fid.item(), kid.item())
+            tqdm.write(f"Val MSE: {mse_mean:.10f}  (saved preds to: {save_root})")
             if use_wandb:
-                wandb.log({'FID': fid.item(), 'KID': kid.item()}, step=step)
+                wandb.log({"val/mse": mse_mean}, step=step)
+
+
 
     def save():
         accelerator.wait_for_everyone()

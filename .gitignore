@@ -16,3 +16,5 @@ wandb/*
 /foj_diffusion_one*/
 /foj_diffusion_two*/
 /exps*/
+/evaluation*/
+/eval*/

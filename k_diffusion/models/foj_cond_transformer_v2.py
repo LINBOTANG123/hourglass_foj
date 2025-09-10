@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 from .image_transformer_v2 import ImageTransformerDenoiserModelV2
+import pdb
 
 class FoJCondTransformerV2(ImageTransformerDenoiserModelV2):
     """

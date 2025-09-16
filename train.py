@@ -283,13 +283,21 @@ def main():
                                             device=device)
 
         # ---------- choose the right dummy aug_cond ----------
-        if hasattr(unwrap(inner_model), "image_encoder"):
-            # FoJ-conditional model → needs an image tensor
+        m = unwrap(inner_model)
+        needs_image_cond = (
+            getattr(m, "expects_image_aug_cond", False) or
+            hasattr(m, "image_encoder") or                  # old version
+            hasattr(m, "image_encoder_global") or           # new version
+            (hasattr(m, "mapping_cond_in_proj") and m.mapping_cond_in_proj is not None)
+        )
+        if needs_image_cond:
             cond_ch = model_config.get("cond_channels", 3)
-            extra["aug_cond"] = torch.zeros([1, cond_ch, *size], device=device)
+            # use random (or any non-zero) dummy to avoid confusing prints/asserts
+            extra["aug_cond"] = torch.randn([1, cond_ch, *size], device=device)
         else:
-            # Vanilla K-Diffusion models → 9-dim augmentation vector
+            # vanilla 9-dim augmentation vector path
             extra["aug_cond"] = torch.zeros([1, 9], device=device)
+        # ------------------------------------------------------
         # ------------------------------------------------------
 
         inner_model(x, sigma, **extra)

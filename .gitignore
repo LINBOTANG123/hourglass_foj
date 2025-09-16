@@ -18,3 +18,6 @@ wandb/*
 /exps*/
 /evaluation*/
 /eval*/
+/old_trainings/
+/udf_diffusion_imgtok_weights/
+

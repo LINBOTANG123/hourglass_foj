@@ -23,4 +23,6 @@ python train.py \
   --num-workers 4 \
   --name foj_diffusion_one_obj \
   --demo-every 10000 \
-  --end-step 10000000
+  --end-step 10000000 \
+  --wandb-project foj-diffusion-1obj \
+  --wandb-entity linbotang0204

@@ -7,6 +7,7 @@ from jsonmerge import merge
 
 from . import augmentation, layers, models, utils
 from .models.foj_cond_transformer_v2 import FoJCondTransformerV2
+from .models.foj_cond_transformer_v2_stereo import FoJCondTransformerV2StereoDual
 
 
 def round_to_power_of_two(x, tol):
@@ -124,7 +125,7 @@ def load_config(path_or_dict):
         config = merge(defaults_image_transformer_v1, config)
         if not config['model']['d_ff']:
             config['model']['d_ff'] = round_to_power_of_two(config['model']['width'] * 8 / 3, tol=0.05)
-    elif config['model']['type'] in ('image_transformer_v2','foj_cond_transformer_v2'):
+    elif config['model']['type'] in ('image_transformer_v2','foj_cond_transformer_v2', 'foj_cond_transformer_v2_stereo'):
         config = merge(defaults_image_transformer_v2, config)
         if not config['model']['mapping_d_ff']:
             config['model']['mapping_d_ff'] = config['model']['mapping_width'] * 3
@@ -255,6 +256,57 @@ def make_model(config):
             mapping_cond_dim=config['mapping_cond_dim'],
             cond_channels=config['cond_channels'],
         )
+
+    elif config['type'] == 'foj_cond_transformer_v2_stereo':
+        assert len(config['widths']) == len(config['depths'])
+        assert len(config['widths']) == len(config['d_ffs'])
+        assert len(config['widths']) == len(config['self_attns'])
+        assert len(config['widths']) == len(config['dropout_rate'])
+
+        levels = []
+        for depth, width, d_ff, self_attn, dropout in zip(
+            config['depths'],
+            config['widths'],
+            config['d_ffs'],
+            config['self_attns'],
+            config['dropout_rate']
+        ):
+            if self_attn['type'] == 'global':
+                attn_spec = models.image_transformer_v2.GlobalAttentionSpec(self_attn.get('d_head', 64))
+            elif self_attn['type'] == 'neighborhood':
+                attn_spec = models.image_transformer_v2.NeighborhoodAttentionSpec(
+                    self_attn.get('d_head', 64),
+                    self_attn.get('kernel_size', 7),
+                )
+            elif self_attn['type'] == 'shifted-window':
+                attn_spec = models.image_transformer_v2.ShiftedWindowAttentionSpec(
+                    self_attn.get('d_head', 64),
+                    self_attn['window_size']
+                )
+            else:
+                raise ValueError(f"unsupported self attention type {self_attn['type']}")
+
+            levels.append(models.image_transformer_v2.LevelSpec(depth, width, d_ff, attn_spec, dropout))
+
+        mapping = models.image_transformer_v2.MappingSpec(
+            config['mapping_depth'],
+            config['mapping_width'],
+            config['mapping_d_ff'],
+            config['mapping_dropout_rate'],
+        )
+
+        model = FoJCondTransformerV2StereoDual(
+            levels=levels,
+            mapping=mapping,
+            in_channels=config['input_channels'],   # usually 1 (UDF)
+            out_channels=config['output_channels'], # 1 if you return only UDF
+            patch_size=config['patch_size'],
+            num_classes=num_classes + 1 if num_classes else 0,
+            mapping_cond_dim=config['mapping_cond_dim'],
+            cond_channels=config['cond_channels'],  # 6 for stereo L+R
+            disp_norm=config.get('disp_norm', 64.0),   # <— add this
+        )
+
     else:
         raise ValueError(f'unsupported model type {config["type"]}')
     return model
@@ -268,9 +320,14 @@ def make_denoiser_wrapper(config):
     if loss_config == 'karras':
         weighting = config.get('loss_weighting', 'karras')
         scales = config.get('loss_scales', 1)
+        ch_scales = config.get('channel_scales', None)    # <- NEW per-channel multipliers
+        if isinstance(scales, list):
+            # It’s safer to keep scales as scalar; tuple would break freq_weight_1d.
+           # If a list slipped in, pick its first (keeps BC).
+           scales = scales[0] if len(scales) else 1
         if not has_variance:
-            return partial(layers.Denoiser, sigma_data=sigma_data, weighting=weighting, scales=scales)
-        return partial(layers.DenoiserWithVariance, sigma_data=sigma_data, weighting=weighting)
+            return partial(layers.Denoiser, sigma_data=sigma_data, weighting=weighting, scales=scales, channel_scales=ch_scales)
+        return partial(layers.DenoiserWithVariance, sigma_data=sigma_data, weighting=weighting, channel_scales=ch_scales)
     if loss_config == 'simple':
         if has_variance:
             raise ValueError('Simple loss config does not support a variance output')

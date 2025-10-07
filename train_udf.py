@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+
+"""Trains Karras et al. (2022) diffusion models."""
+
+import argparse
+from copy import deepcopy
+from functools import partial
+import importlib.util
+import math
+import json
+from pathlib import Path
+import time
+
+import accelerate
+import safetensors.torch as safetorch
+import torch
+import torch._dynamo
+from torch import distributed as dist
+from torch import multiprocessing as mp
+from torch import optim
+from torch.utils import data, flop_counter
+from torchvision import datasets, transforms, utils
+from tqdm.auto import tqdm
+import pdb
+import numpy as np
+
+import k_diffusion as K
+
+
+def ensure_distributed():
+    if not dist.is_initialized():
+        dist.init_process_group(world_size=1, rank=0, store=dist.HashStore())
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--batch-size', type=int, default=64,
+                   help='the batch size')
+    p.add_argument('--checkpointing', action='store_true',
+                   help='enable gradient checkpointing')
+    p.add_argument('--clip-model', type=str, default='ViT-B/16',
+                   choices=K.evaluation.CLIPFeatureExtractor.available_models(),
+                   help='the CLIP model to use to evaluate')
+    p.add_argument('--compile', action='store_true',
+                   help='compile the model')
+    p.add_argument('--config', type=str, required=True,
+                   help='the configuration file')
+    p.add_argument('--demo-every', type=int, default=500,
+                   help='save a demo grid every this many steps')
+    p.add_argument('--dinov2-model', type=str, default='vitl14',
+                   choices=K.evaluation.DINOv2FeatureExtractor.available_models(),
+                   help='the DINOv2 model to use to evaluate')
+    p.add_argument('--end-step', type=int, default=None,
+                   help='the step to end training at')
+    p.add_argument('--evaluate-every', type=int, default=10000,
+                   help='evaluate every this many steps')
+    p.add_argument('--evaluate-n', type=int, default=2000,
+                   help='the number of samples to draw to evaluate')
+    p.add_argument('--evaluate-only', action='store_true',
+                   help='evaluate instead of training')
+    p.add_argument('--evaluate-with', type=str, default='inception',
+                   choices=['inception', 'clip', 'dinov2'],
+                   help='the feature extractor to use for evaluation')
+    p.add_argument('--gns', action='store_true',
+                   help='measure the gradient noise scale (DDP only, disables stratified sampling)')
+    p.add_argument('--grad-accum-steps', type=int, default=1,
+                   help='the number of gradient accumulation steps')
+    p.add_argument('--lr', type=float,
+                   help='the learning rate')
+    p.add_argument('--mixed-precision', type=str,
+                   help='the mixed precision type')
+    p.add_argument('--name', type=str, default='model',
+                   help='the name of the run')
+    p.add_argument('--num-workers', type=int, default=8,
+                   help='the number of data loader workers')
+    p.add_argument('--reset-ema', action='store_true',
+                   help='reset the EMA')
+    p.add_argument('--resume', type=str,
+                   help='the checkpoint to resume from')
+    p.add_argument('--resume-inference', type=str,
+                   help='the inference checkpoint to resume from')
+    p.add_argument('--sample-n', type=int, default=64,
+                   help='the number of images to sample for demo grids')
+    p.add_argument('--save-every', type=int, default=10000,
+                   help='save every this many steps')
+    p.add_argument('--seed', type=int,
+                   help='the random seed')
+    p.add_argument('--start-method', type=str, default='spawn',
+                   choices=['fork', 'forkserver', 'spawn'],
+                   help='the multiprocessing start method')
+    p.add_argument('--wandb-entity', type=str,
+                   help='the wandb entity name')
+    p.add_argument('--wandb-group', type=str,
+                   help='the wandb group name')
+    p.add_argument('--wandb-project', type=str,
+                   help='the wandb project name (specify this to enable wandb)')
+    p.add_argument('--wandb-save-model', action='store_true',
+                   help='save model to wandb')
+    
+    p.add_argument('--bw-enable', action='store_true',
+               help='Enable boundary-weighted auxiliary loss on the zero-level band.')
+    p.add_argument('--bw-tau-px', type=float, default=2.0,
+                help='Half-width of boundary band τ (in pixels).')
+    p.add_argument('--bw-alpha', type=float, default=5.0,
+                help='Band emphasis α (1 + α inside the band).')
+    p.add_argument('--bw-lambda', type=float, default=0.3,
+                help='Mixing weight λ for the boundary loss term.')
+    p.add_argument('--bw-soft-beta-px', type=float, default=0.0,
+                help='If >0, use soft Gaussian band with β (pixels); if 0, use hard band.')
+
+    args = p.parse_args()
+
+    mp.set_start_method(args.start_method)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        torch._dynamo.config.automatic_dynamic_shapes = False
+    except AttributeError:
+        pass
+
+    config = K.config.load_config(args.config)
+    model_config = config['model']
+    dataset_config = config['dataset']
+    opt_config = config['optimizer']
+    sched_config = config['lr_sched']
+    ema_sched_config = config['ema_sched']
+
+    # TODO: allow non-square input sizes
+    assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
+    size = model_config['input_size']
+
+    accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps, mixed_precision=args.mixed_precision)
+    ensure_distributed()
+    device = accelerator.device
+    unwrap = accelerator.unwrap_model
+    print(f'Process {accelerator.process_index} using device: {device}', flush=True)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print(f'World size: {accelerator.num_processes}', flush=True)
+        print(f'Batch size: {args.batch_size * accelerator.num_processes}', flush=True)
+
+    if args.seed is not None:
+        seeds = torch.randint(-2 ** 63, 2 ** 63 - 1, [accelerator.num_processes], generator=torch.Generator().manual_seed(args.seed))
+        torch.manual_seed(seeds[accelerator.process_index])
+    demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
+    elapsed = 0.0
+
+    inner_model = K.config.make_model(config)
+    inner_model_ema = deepcopy(inner_model)
+
+    if args.compile:
+        inner_model.compile()
+        # inner_model_ema.compile()
+
+    if accelerator.is_main_process:
+        print(f'Parameters: {K.utils.n_params(inner_model):,}')
+
+    lr = opt_config['lr'] if args.lr is None else args.lr
+    groups = inner_model.param_groups(lr)
+    if opt_config['type'] == 'adamw':
+        opt = optim.AdamW(groups,
+                          lr=lr,
+                          betas=tuple(opt_config['betas']),
+                          eps=opt_config['eps'],
+                          weight_decay=opt_config['weight_decay'])
+    elif opt_config['type'] == 'adam8bit':
+        import bitsandbytes as bnb
+        opt = bnb.optim.Adam8bit(groups,
+                                 lr=lr,
+                                 betas=tuple(opt_config['betas']),
+                                 eps=opt_config['eps'],
+                                 weight_decay=opt_config['weight_decay'])
+    elif opt_config['type'] == 'sgd':
+        opt = optim.SGD(groups,
+                        lr=lr,
+                        momentum=opt_config.get('momentum', 0.),
+                        nesterov=opt_config.get('nesterov', False),
+                        weight_decay=opt_config.get('weight_decay', 0.))
+    else:
+        raise ValueError('Invalid optimizer type')
+
+    if sched_config['type'] == 'inverse':
+        sched = K.utils.InverseLR(opt,
+                                  inv_gamma=sched_config['inv_gamma'],
+                                  power=sched_config['power'],
+                                  warmup=sched_config['warmup'])
+    elif sched_config['type'] == 'exponential':
+        sched = K.utils.ExponentialLR(opt,
+                                      num_steps=sched_config['num_steps'],
+                                      decay=sched_config['decay'],
+                                      warmup=sched_config['warmup'])
+    elif sched_config['type'] == 'constant':
+        sched = K.utils.ConstantLRWithWarmup(opt, warmup=sched_config['warmup'])
+    else:
+        raise ValueError('Invalid schedule type')
+
+    assert ema_sched_config['type'] == 'inverse'
+    ema_sched = K.utils.EMAWarmup(power=ema_sched_config['power'],
+                                  max_value=ema_sched_config['max_value'])
+    ema_stats = {}
+
+    tf = transforms.Compose([
+        transforms.Resize(size[0], interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(size[0]),
+        K.augmentation.KarrasAugmentationPipeline(model_config['augment_prob'], disable_all=model_config['augment_prob'] == 0),
+        # transforms.ToTensor(),
+    ])
+
+    if dataset_config['type'] == 'imagefolder':
+        train_set = K.utils.FolderOfImages(dataset_config['location'], transform=tf)
+    elif dataset_config['type'] == 'imagefolder-class':
+        train_set = datasets.ImageFolder(dataset_config['location'], transform=tf)
+    elif dataset_config['type'] == 'cifar10':
+        train_set = datasets.CIFAR10(dataset_config['location'], train=True, download=True, transform=tf)
+    elif dataset_config['type'] == 'mnist':
+        train_set = datasets.MNIST(dataset_config['location'], train=True, download=True, transform=tf)
+    elif dataset_config['type'] == 'huggingface':
+        from datasets import load_dataset
+        train_set = load_dataset(dataset_config['location'])
+        train_set.set_transform(partial(K.utils.hf_datasets_augs_helper, transform=tf, image_key=dataset_config['image_key']))
+        train_set = train_set['train']
+    elif dataset_config['type'] == 'custom':
+        location = (Path(args.config).parent / dataset_config['location']).resolve()
+        spec = importlib.util.spec_from_file_location('custom_dataset', location)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        get_dataset = getattr(module, dataset_config.get('get_dataset', 'FoJDataset'))
+        custom_dataset_config = dataset_config.get('config', {})
+
+        # 1) Instantiate without transform arg
+        train_set = get_dataset(**custom_dataset_config)
+
+        # after creating `train_set` and `get_dataset` above
+        val_cfg = dataset_config.get("val_config", None)
+        if val_cfg is not None:
+            val_set = get_dataset(**val_cfg)
+        else:
+            # fallback: small random split from train_set if no val_config provided
+            n_total = len(train_set)
+            n_val   = max(1, int(0.05 * n_total))
+            n_train = n_total - n_val
+            train_set, val_set = torch.utils.data.random_split(
+                train_set, [n_train, n_val],
+                generator=torch.Generator().manual_seed(123)
+            )
+
+        val_dl = data.DataLoader(
+            val_set,
+            args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=args.num_workers,
+            persistent_workers=True,
+            pin_memory=True
+        )
+
+    # If logging to wandb, initialize the run
+    use_wandb = accelerator.is_main_process and args.wandb_project
+    if use_wandb:
+        import wandb
+        log_config = vars(args)
+        log_config['config'] = config
+        log_config['parameters'] = K.utils.n_params(inner_model)
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.wandb_group, config=log_config, save_code=True)
+        
+    else:
+        raise ValueError('Invalid dataset type')
+
+    if accelerator.is_main_process:
+        try:
+            print(f'Number of items in dataset: {len(train_set):,}')
+        except TypeError:
+            pass
+
+    image_key = dataset_config.get('image_key', 0)
+    num_classes = dataset_config.get('num_classes', 0)
+    cond_dropout_rate = dataset_config.get('cond_dropout_rate', 0.1)
+    class_key = dataset_config.get('class_key', 1)
+
+    train_dl = data.DataLoader(train_set, args.batch_size, shuffle=True, drop_last=True,
+                               num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+
+    # inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    inner_model, inner_model_ema, opt, train_dl, val_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl, val_dl)
+
+
+    with torch.no_grad(), K.models.flops.flop_counter() as fc:
+        x     = torch.zeros([1, model_config['input_channels'], *size],
+                            device=device)
+        sigma = torch.ones([1], device=device)
+        extra = {}
+
+        if getattr(unwrap(inner_model), "num_classes", 0):
+            extra["class_cond"] = torch.zeros([1], dtype=torch.long,
+                                            device=device)
+
+        # ---------- choose the right dummy aug_cond ----------
+        m = unwrap(inner_model)
+        needs_image_cond = (
+            getattr(m, "expects_image_aug_cond", False) or
+            hasattr(m, "image_encoder") or                  # old version
+            hasattr(m, "image_encoder_global") or           # new version
+            (hasattr(m, "mapping_cond_in_proj") and m.mapping_cond_in_proj is not None)
+        )
+        if needs_image_cond:
+            cond_ch = model_config.get("cond_channels", 3)
+            # use random (or any non-zero) dummy to avoid confusing prints/asserts
+            extra["aug_cond"] = torch.randn([1, cond_ch, *size], device=device)
+        else:
+            # vanilla 9-dim augmentation vector path
+            extra["aug_cond"] = torch.zeros([1, 9], device=device)
+        # ------------------------------------------------------
+        # ------------------------------------------------------
+
+        inner_model(x, sigma, **extra)
+        if accelerator.is_main_process:
+            print(f"Forward pass GFLOPs: {fc.flops/1e9:,.3f}")
+
+
+    if use_wandb:
+        wandb.watch(inner_model)
+    if accelerator.num_processes == 1:
+        args.gns = False
+    if args.gns:
+        gns_stats_hook = K.gns.DDPGradientStatsHook(inner_model)
+        gns_stats = K.gns.GradientNoiseScale()
+    else:
+        gns_stats = None
+    sigma_min = model_config['sigma_min']
+    sigma_max = model_config['sigma_max']
+    sample_density = K.config.make_sample_density(model_config)
+
+    model = K.config.make_denoiser_wrapper(config)(inner_model)
+    model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
+
+    state_path = Path(f'{args.name}_state.json')
+
+    if state_path.exists() or args.resume:
+        if args.resume:
+            ckpt_path = args.resume
+        if not args.resume:
+            state = json.load(open(state_path))
+            ckpt_path = state['latest_checkpoint']
+        if accelerator.is_main_process:
+            print(f'Resuming from {ckpt_path}...')
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        unwrap(model.inner_model).load_state_dict(ckpt['model'])
+        unwrap(model_ema.inner_model).load_state_dict(ckpt['model_ema'])
+        opt.load_state_dict(ckpt['opt'])
+        sched.load_state_dict(ckpt['sched'])
+        ema_sched.load_state_dict(ckpt['ema_sched'])
+        ema_stats = ckpt.get('ema_stats', ema_stats)
+        epoch = ckpt['epoch'] + 1
+        step = ckpt['step'] + 1
+        if args.gns and ckpt.get('gns_stats', None) is not None:
+            gns_stats.load_state_dict(ckpt['gns_stats'])
+        demo_gen.set_state(ckpt['demo_gen'])
+        elapsed = ckpt.get('elapsed', 0.0)
+
+        del ckpt
+    else:
+        epoch = 0
+        step = 0
+
+    if args.reset_ema:
+        unwrap(model.inner_model).load_state_dict(unwrap(model_ema.inner_model).state_dict())
+        ema_sched = K.utils.EMAWarmup(power=ema_sched_config['power'],
+                                      max_value=ema_sched_config['max_value'])
+        ema_stats = {}
+
+    if args.resume_inference:
+        if accelerator.is_main_process:
+            print(f'Loading {args.resume_inference}...')
+        ckpt = safetorch.load_file(args.resume_inference)
+        unwrap(model.inner_model).load_state_dict(ckpt)
+        unwrap(model_ema.inner_model).load_state_dict(ckpt)
+        del ckpt
+
+    evaluate_enabled = (args.evaluate_every > 0) and (val_dl is not None)
+    metrics_log = None
+    # if evaluate_enabled:
+    #     if args.evaluate_with == 'inception':
+    #         extractor = K.evaluation.InceptionV3FeatureExtractor(device=device)
+    #     elif args.evaluate_with == 'clip':
+    #         extractor = K.evaluation.CLIPFeatureExtractor(args.clip_model, device=device)
+    #     elif args.evaluate_with == 'dinov2':
+    #         extractor = K.evaluation.DINOv2FeatureExtractor(args.dinov2_model, device=device)
+    #     else:
+    #         raise ValueError('Invalid evaluation feature extractor')
+    #     train_iter = iter(train_dl)
+    #     if accelerator.is_main_process:
+    #         print('Computing features for reals...')
+    #     reals_features = K.evaluation.compute_features(accelerator, lambda x: next(train_iter)[image_key][1], extractor, args.evaluate_n, args.batch_size)
+    #     if accelerator.is_main_process and not args.evaluate_only:
+    #         metrics_log = K.utils.CSVLogger(f'{args.name}_metrics.csv', ['step', 'time', 'loss', 'fid', 'kid'])
+    #     del train_iter
+
+    cfg_scale = 1.
+
+    def make_cfg_model_fn(model):
+        def cfg_model_fn(x, sigma, class_cond):
+            x_in = torch.cat([x, x])
+            sigma_in = torch.cat([sigma, sigma])
+            class_uncond = torch.full_like(class_cond, num_classes)
+            class_cond_in = torch.cat([class_uncond, class_cond])
+            out = model(x_in, sigma_in, class_cond=class_cond_in)
+            out_uncond, out_cond = out.chunk(2)
+            return out_uncond + (out_cond - out_uncond) * cfg_scale
+        if cfg_scale != 1:
+            return cfg_model_fn
+        return model
+
+    @torch.no_grad()
+    @K.utils.eval_mode(model_ema)
+    def demo():
+        if accelerator.is_main_process:
+            tqdm.write("Sampling…")
+
+        filename = f"{args.name}_demo_{step:08}.png"
+
+        # ───────────────────────────────────────────────────────────
+        # 1. Allocate latent noise  x  exactly as before
+        # ───────────────────────────────────────────────────────────
+        n_per_proc = math.ceil(args.sample_n / accelerator.num_processes)
+
+        x = torch.randn(
+                [accelerator.num_processes, n_per_proc,
+                model_config["input_channels"], size[0], size[1]],
+                generator=demo_gen
+            ).to(device)                                    # ← on GPU
+        dist.broadcast(x, 0)
+        x = x[accelerator.process_index] * sigma_max
+
+        # ───────────────────────────────────────────────────────────
+        # 2. Build   extra_args   for the FoJ model
+        #    • we still support class_cond, cfg, etc.
+        #    • BUT we *add* an RGB conditioning image tensor
+        # ───────────────────────────────────────────────────────────
+        model_fn, extra_args = model_ema, {}
+
+        # 2-a class-conditioning (unchanged)
+        if num_classes:
+            class_cond = torch.randint(
+                0, num_classes,
+                [accelerator.num_processes, n_per_proc],
+                generator=demo_gen, device=device)
+            dist.broadcast(class_cond, 0)
+            extra_args["class_cond"] = class_cond[accelerator.process_index]
+            model_fn = make_cfg_model_fn(model_ema)
+
+        def extract_rgb(sample):
+            """
+            Returns a 3×H×W RGB tensor from a dataset element.
+
+            Handles either:
+            • (payload, label)
+            • payload
+            where payload ≡ (foj_t, aug_vec_9, img_tensor)
+            """
+            # If we got the outer (payload, label) tuple, strip the label first
+            if isinstance(sample, (tuple, list)) and len(sample) == 2 and torch.is_tensor(sample[1]):
+                sample = sample[0]
+
+            last = sample[-1]
+            if isinstance(last, torch.Tensor) and last.dim() == 3 and last.size(0) == 3:
+                return last
+
+            if isinstance(last, (tuple, list)):
+                for x in last:
+                    if isinstance(x, torch.Tensor) and x.dim() == 3 and x.size(0) == 3:
+                        return x
+
+            raise RuntimeError("No 3-channel image found in sample")
+
+
+        if accelerator.is_main_process:
+            gen  = torch.Generator().manual_seed(step)           # deterministic
+            # pdb.set_trace()
+            idxs = torch.randint(0, len(train_set),
+                                (n_per_proc,), generator=gen).tolist()
+
+            cond_rank0 = torch.stack([extract_rgb(train_set[i]) for i in idxs])
+                                                            # [n, 3, H, W]
+        else:
+            cond_rank0 = torch.empty(
+                [n_per_proc, 3, *size], dtype=torch.float32, device=device)
+
+        # move to GPU + dtype fix + normalise
+        cond_rank0 = cond_rank0.to(device, dtype=torch.float32)
+        if cond_rank0.max() > 1:                # dataset might be 0-255
+            cond_rank0.div_(255.)
+
+        dist.broadcast(cond_rank0, 0)
+
+        extra_args = {"aug_cond": cond_rank0}
+
+        # ───────────────────────────────────────────────────────────
+        # 3. Sample with K-Diffusion’s DPMPP-2M-SDE solver
+        # ───────────────────────────────────────────────────────────
+        sigmas = K.sampling.get_sigmas_karras(
+                    50, sigma_min, sigma_max, rho=7., device=device)
+
+        x_0 = K.sampling.sample_dpmpp_2m_sde(
+                model_fn, x, sigmas,
+                extra_args=extra_args,
+                eta=0.0, solver_type="heun",
+                disable=not accelerator.is_main_process)
+
+        # gather tensors to rank-0
+        x_0       = accelerator.gather(x_0)[:args.sample_n]      # (N,7,H,W)
+        cond_imgs = accelerator.gather(cond_rank0)[:args.sample_n]  # (N,3,H,W)
+
+        if accelerator.is_main_process:
+            import numpy as np
+            from PIL import Image
+            import os
+
+            out_dir = f"{args.name}_demo"               # e.g. foj_diffusion_memfit_demo
+            os.makedirs(out_dir, exist_ok=True)
+
+            H, W = x_0.shape[2:]
+
+            for k in range(x_0.size(0)):
+                # 1. save predicted FoJ field  (7,H,W) → (H,W,7)
+                foj_np = x_0[k].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                np.save(os.path.join(
+                    out_dir, f"{args.name}_step{step:08}_sample{k:02}_field.npy"),
+                    foj_np)
+
+                # 2. save conditioning RGB image  (3,H,W) → PNG in [0,255]
+                img_np = (cond_imgs[k].cpu().clamp(0,1).permute(1, 2, 0) * 255).byte().numpy()
+                Image.fromarray(img_np).save(os.path.join(
+                    out_dir, f"{args.name}_step{step:08}_sample{k:02}_img.png"))
+                
+    u_scale = None
+    try:
+        u_scale = config["dataset"]["val_config"].get("u_scale", None)
+    except Exception:
+        u_scale = config["dataset"].get("config", {}).get("u_scale", None)
+    if u_scale is None:
+        u_scale = 1.0
+                    
+    @torch.no_grad()
+    @K.utils.eval_mode(model_ema)
+    def evaluate():
+        if not evaluate_enabled:
+            return
+        if accelerator.is_main_process:
+            tqdm.write("Evaluating MSE on validation set...")
+
+        # 50-step sampler (reduce to 30 for speed if needed)
+        sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
+
+        # Accumulators
+        mse_sum = 0.0
+        pix_sum = 0.0
+
+        # Where to save predictions for this eval pass
+        save_root = Path(f"{args.name}_evalpreds") / f"step_{step:08d}"
+        save_root.mkdir(parents=True, exist_ok=True) if accelerator.is_main_process else None
+
+        # Running index for filenames (per eval pass)
+        global_idx = 0
+
+        for batch in tqdm(val_dl, leave=False, disable=not accelerator.is_main_process):
+            # Dataset returns ((field, aug_vec_9, img_rgb), label)
+            reals, _, aug_cond = batch[image_key]      # reals: (N,1,H,W) in training scale; aug_cond: (N,3,H,W)
+
+            # Sample from noise with EMA model, conditioned on RGB
+            x = torch.randn_like(reals) * sigma_max
+            x_pred = K.sampling.sample_dpmpp_2m_sde(
+                model_ema, x, sigmas,
+                extra_args={"aug_cond": aug_cond},
+                eta=0.0, solver_type="heun", disable=True
+            )  # (N,1,H,W)
+
+            # ---- MSE (in the SAME scale as training targets) ----
+            se = (x_pred - reals).pow(2).sum()                          # sum, not mean
+            se = accelerator.gather(se).sum().item()                    # scalar
+            npx = accelerator.gather(torch.tensor([reals.numel()], 
+                    device=device, dtype=torch.float32)).sum().item()
+
+            mse_sum += se
+            pix_sum += npx
+
+            # ---- Save predictions as .npy on rank 0 ----
+            if accelerator.is_main_process:
+                N = x_pred.size(0)
+                for i in range(N):
+                    pred = x_pred[i, 0].detach().cpu().float().numpy()   # (H,W) in training scale
+                    # Optionally unscale to pixel units if you trained with u_scale
+                    if u_scale is not None and u_scale > 0:
+                        pred_to_save = pred * float(u_scale)
+                    else:
+                        pred_to_save = pred
+
+                    np.save(save_root / f"val_{global_idx:06d}_pred_udf.npy", pred_to_save.astype(np.float32))
+                    global_idx += 1
+
+        mse_mean = mse_sum / pix_sum
+        if accelerator.is_main_process:
+            tqdm.write(f"Val MSE: {mse_mean:.10f}  (saved preds to: {save_root})")
+            if use_wandb:
+                wandb.log({"val/mse": mse_mean}, step=step)
+
+
+
+    def save():
+        accelerator.wait_for_everyone()
+        filename = f'{args.name}_{step:08}.pth'
+        if accelerator.is_main_process:
+            tqdm.write(f'Saving to {filename}...')
+        inner_model = unwrap(model.inner_model)
+        inner_model_ema = unwrap(model_ema.inner_model)
+        obj = {
+            'config': config,
+            'model': inner_model.state_dict(),
+            'model_ema': inner_model_ema.state_dict(),
+            'opt': opt.state_dict(),
+            'sched': sched.state_dict(),
+            'ema_sched': ema_sched.state_dict(),
+            'epoch': epoch,
+            'step': step,
+            'gns_stats': gns_stats.state_dict() if gns_stats is not None else None,
+            'ema_stats': ema_stats,
+            'demo_gen': demo_gen.get_state(),
+            'elapsed': elapsed,
+        }
+        accelerator.save(obj, filename)
+        if accelerator.is_main_process:
+            state_obj = {'latest_checkpoint': filename}
+            json.dump(state_obj, open(state_path, 'w'))
+        if args.wandb_save_model and use_wandb:
+            wandb.save(filename)
+
+    if args.evaluate_only:
+        if not evaluate_enabled:
+            raise ValueError('--evaluate-only requested but evaluation is disabled')
+        evaluate()
+        return
+
+    losses_since_last_print = []
+
+    try:
+        while True:
+            for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
+                if device.type == 'cuda':
+                    start_timer = torch.cuda.Event(enable_timing=True)
+                    end_timer = torch.cuda.Event(enable_timing=True)
+                    torch.cuda.synchronize()
+                    start_timer.record()
+                else:
+                    start_timer = time.time()
+
+                with accelerator.accumulate(model):
+                    # pdb.set_trace()
+                    reals, _, aug_cond = batch[image_key]
+                    class_cond, extra_args = None, {}
+                    if num_classes:
+                        class_cond = batch[class_key]
+                        drop = torch.rand(class_cond.shape, device=class_cond.device)
+                        class_cond.masked_fill_(drop < cond_dropout_rate, num_classes)
+                        extra_args['class_cond'] = class_cond
+                    noise = torch.randn_like(reals)
+                    with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
+                        sigma = sample_density([reals.shape[0]], device=device)
+
+                    with K.models.checkpointing(args.checkpointing):
+                        losses = model.loss(reals, noise, sigma, aug_cond=aug_cond, **extra_args)
+                    loss = accelerator.gather(losses).mean().item()
+                    losses_since_last_print.append(loss)
+                    accelerator.backward(losses.mean())
+
+                    # MODIFY: add boundary loss
+                    # --- Base EDM loss (unchanged) ---
+                    # with K.models.checkpointing(args.checkpointing):
+                    #     base_losses = model.loss(reals, noise, sigma, aug_cond=aug_cond, **extra_args)  # (N,)
+                    # base_loss_mean = base_losses.mean()
+
+                    # # --- Boundary-weighted auxiliary loss (optional) ---
+                    # if args.bw_enable and args.bw_lambda > 0.0:
+                    #     # 1) Build noisy input matching the base loss sigma/noise
+                    #     #    x_noisy = reals + noise * sigma (broadcast sigma to NCHW)
+                    #     sigma_ = sigma.view(-1, 1, 1, 1)  # (N,1,1,1)
+                    #     x_noisy = reals + noise * sigma_
+
+                    #     # 2) Denoiser prediction (same conditioning)
+                    #     #    IMPORTANT: needs grad (do NOT wrap in no_grad)
+                    #     pred = model(x_noisy, sigma, aug_cond=aug_cond, **extra_args)  # (N,1,H,W), same units as reals
+
+                    #     # 3) Per-pixel weights from GT UDF in *pixel* units
+                    #     d_gt_px = reals * float(u_scale)  # if already in pixels, u_scale==1
+                    #     if args.bw_soft_beta_px > 0.0:
+                    #         # soft Gaussian band: w = 1 + α * exp(-(d/β)^2)
+                    #         beta = float(args.bw_soft_beta_px)
+                    #         w = 1.0 + float(args.bw_alpha) * torch.exp(-(d_gt_px / beta) ** 2)
+                    #     else:
+                    #         # hard band: w = 1 + α * 1[d <= τ]
+                    #         tau = float(args.bw_tau_px)
+                    #         band = (d_gt_px <= tau).float()
+                    #         w = 1.0 + float(args.bw_alpha) * band
+
+                    #     # 4) Weighted MSE on (pred - reals), normalized by total weight
+                    #     resid = (pred - reals)  # (N,1,H,W)
+                    #     loss_map = w * (resid ** 2)
+                    #     # normalize per-sample to keep scale stable, then average over batch
+                    #     bw_losses = loss_map.flatten(1).sum(dim=1) / (w.flatten(1).sum(dim=1) + 1e-8)  # (N,)
+                    #     bw_loss_mean = bw_losses.mean()
+
+                    #     # 5) Combine
+                    #     total_loss = base_loss_mean + float(args.bw_lambda) * bw_loss_mean
+                    # else:
+                    #     bw_loss_mean = torch.tensor(0.0, device=base_loss_mean.device)
+                    #     total_loss = base_loss_mean
+
+                    # # --- Backprop on combined loss ---
+                    # accelerator.backward(total_loss)
+
+                    # # ----- Scalars for logging / EMA / rolling stats -----
+                    # # Mean over *all samples across processes* for clean logs
+                    # base_loss_item = accelerator.gather(base_losses.detach()).float().mean().item()
+                    # if args.bw_enable and args.bw_lambda > 0.0:
+                    #     bw_loss_item = accelerator.gather(bw_losses.detach()).float().mean().item()
+                    # else:
+                    #     bw_loss_item = 0.0
+                    # total_loss_item = base_loss_item + float(args.bw_lambda) * bw_loss_item
+
+                    # # For the rolling print every 25 steps
+                    # losses_since_last_print.append(total_loss_item)
+
+                    if args.gns:
+                        sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
+                        gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, reals.shape[0], reals.shape[0] * accelerator.num_processes)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.)
+                    opt.step()
+                    sched.step()
+                    opt.zero_grad()
+
+                    # ema_decay = ema_sched.get_value()
+                    # K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
+                    # if accelerator.sync_gradients:
+                    #     K.utils.ema_update(model, model_ema, ema_decay)
+                    #     ema_sched.step()
+
+                    ema_decay = ema_sched.get_value()
+                    K.utils.ema_update_dict(ema_stats, {'loss': total_loss_item}, ema_decay ** (1 / args.grad_accum_steps))
+                    if accelerator.sync_gradients:
+                        K.utils.ema_update(model, model_ema, ema_decay)
+                        ema_sched.step()
+
+                if device.type == 'cuda':
+                    end_timer.record()
+                    torch.cuda.synchronize()
+                    elapsed += start_timer.elapsed_time(end_timer) / 1000
+                else:
+                    elapsed += time.time() - start_timer
+
+                if step % 25 == 0:
+                    loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
+                    losses_since_last_print.clear()
+                    avg_loss = ema_stats['loss']
+                    if accelerator.is_main_process:
+                        if args.gns:
+                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
+                        else:
+                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
+
+                # if use_wandb:
+                #     log_dict = {
+                #         'epoch': epoch,
+                #         'loss': loss,
+                #         'lr': sched.get_last_lr()[0],
+                #         'ema_decay': ema_decay,
+                #     }
+                #     if args.gns:
+                #         log_dict['gradient_noise_scale'] = gns_stats.get_gns()
+                #     wandb.log(log_dict, step=step)
+
+                if use_wandb:
+                    log_dict = {
+                        'epoch': epoch,
+                        'loss': total_loss_item,
+                        'loss/base': base_loss_item,
+                        'loss/bw': bw_loss_item,
+                        'lr': sched.get_last_lr()[0],
+                        'ema_decay': ema_decay,
+                    }
+                    if args.gns:
+                        log_dict['gradient_noise_scale'] = gns_stats.get_gns()
+                    wandb.log(log_dict, step=step)
+                step += 1
+
+                if step % args.demo_every == 0:
+                    demo()
+
+                if evaluate_enabled and step > 0 and step % args.evaluate_every == 0:
+                    evaluate()
+
+                if step == args.end_step or (step > 0 and step % args.save_every == 0):
+                    save()
+
+                if step == args.end_step:
+                    if accelerator.is_main_process:
+                        tqdm.write('Done!')
+                    return
+
+            epoch += 1
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == '__main__':
+    main()

@@ -97,6 +97,25 @@ def main():
                    help='the wandb project name (specify this to enable wandb)')
     p.add_argument('--wandb-save-model', action='store_true',
                    help='save model to wandb')
+    
+    # p.add_argument('--bw-enable', action='store_true',
+    #            help='Enable boundary-weighted auxiliary loss on the zero-level band.')
+    # p.add_argument('--bw-tau-px', type=float, default=2.0,
+    #             help='Half-width of boundary band τ (in pixels).')
+    # p.add_argument('--bw-alpha', type=float, default=5.0,
+    #             help='Band emphasis α (1 + α inside the band).')
+    # p.add_argument('--bw-lambda', type=float, default=0.3,
+    #             help='Mixing weight λ for the boundary loss term.')
+    # p.add_argument('--bw-soft-beta-px', type=float, default=0.0,
+    #             help='If >0, use soft Gaussian band with β (pixels); if 0, use hard band.')
+
+    p.add_argument('--disp-lambda', type=float, default=1.0,
+               help='Weight for disparity supervision loss.')
+    p.add_argument('--charb-eps', type=float, default=1e-3,
+               help='Charbonnier epsilon for disparity loss.')
+    p.add_argument('--udf-lambda', type=float, default=1.0,
+               help='Weight for UDF supervision loss (MSE).')
+
     args = p.parse_args()
 
     mp.set_start_method(args.start_method)
@@ -436,29 +455,43 @@ def main():
             extra_args["class_cond"] = class_cond[accelerator.process_index]
             model_fn = make_cfg_model_fn(model_ema)
 
-        def extract_rgb(sample):
-            """
-            Returns a 3×H×W RGB tensor from a dataset element.
+        # def extract_rgb(sample):
+        #     """
+        #     Returns a 3×H×W RGB tensor from a dataset element.
 
-            Handles either:
-            • (payload, label)
-            • payload
-            where payload ≡ (foj_t, aug_vec_9, img_tensor)
+        #     Handles either:
+        #     • (payload, label)
+        #     • payload
+        #     where payload ≡ (foj_t, aug_vec_9, img_tensor)
+        #     """
+        #     # If we got the outer (payload, label) tuple, strip the label first
+        #     if isinstance(sample, (tuple, list)) and len(sample) == 2 and torch.is_tensor(sample[1]):
+        #         sample = sample[0]
+
+        #     last = sample[-1]
+        #     if isinstance(last, torch.Tensor) and last.dim() == 3 and last.size(0) == 3:
+        #         return last
+
+        #     if isinstance(last, (tuple, list)):
+        #         for x in last:
+        #             if isinstance(x, torch.Tensor) and x.dim() == 3 and x.size(0) == 3:
+        #                 return x
+
+        #     raise RuntimeError("No 3-channel image found in sample")
+
+        def extract_cond6(sample):
             """
-            # If we got the outer (payload, label) tuple, strip the label first
-            if isinstance(sample, (tuple, list)) and len(sample) == 2 and torch.is_tensor(sample[1]):
+            Returns the stacked [L;R] 6×H×W conditioning tensor from a dataset element.
+            Dataset payload ≡ (foj_t, aug_vec_9, img_stacked_6ch, disp_t)
+            """
+            # If we got (payload, label), strip the label first
+            if isinstance(sample, (tuple, list)) and len(sample) == 2:
                 sample = sample[0]
-
-            last = sample[-1]
-            if isinstance(last, torch.Tensor) and last.dim() == 3 and last.size(0) == 3:
-                return last
-
-            if isinstance(last, (tuple, list)):
-                for x in last:
-                    if isinstance(x, torch.Tensor) and x.dim() == 3 and x.size(0) == 3:
-                        return x
-
-            raise RuntimeError("No 3-channel image found in sample")
+            # payload[2] is 6×H×W
+            cond = sample[2]
+            if not (isinstance(cond, torch.Tensor) and cond.dim() == 3 and cond.size(0) == 6):
+                raise RuntimeError("Expected 6-ch conditioning tensor in dataset payload[2].")
+            return cond
 
 
         if accelerator.is_main_process:
@@ -467,16 +500,15 @@ def main():
             idxs = torch.randint(0, len(train_set),
                                 (n_per_proc,), generator=gen).tolist()
 
-            cond_rank0 = torch.stack([extract_rgb(train_set[i]) for i in idxs])
-                                                            # [n, 3, H, W]
+            cond_rank0 = torch.stack([extract_cond6(train_set[i]) for i in idxs])  # [n, 6, H, W]
         else:
-            cond_rank0 = torch.empty(
-                [n_per_proc, 3, *size], dtype=torch.float32, device=device)
+            cond_rank0 = torch.empty([n_per_proc, 6, *size], dtype=torch.float32, device=device)
+
 
         # move to GPU + dtype fix + normalise
         cond_rank0 = cond_rank0.to(device, dtype=torch.float32)
-        if cond_rank0.max() > 1:                # dataset might be 0-255
-            cond_rank0.div_(255.)
+        # if cond_rank0.max() > 1:                # dataset might be 0-255
+        #     cond_rank0.div_(255.)
 
         dist.broadcast(cond_rank0, 0)
 
@@ -525,6 +557,8 @@ def main():
         u_scale = config["dataset"]["val_config"].get("u_scale", None)
     except Exception:
         u_scale = config["dataset"].get("config", {}).get("u_scale", None)
+    if u_scale is None:
+        u_scale = 1.0
                     
     @torch.no_grad()
     @K.utils.eval_mode(model_ema)
@@ -538,8 +572,10 @@ def main():
         sigmas = K.sampling.get_sigmas_karras(50, sigma_min, sigma_max, rho=7., device=device)
 
         # Accumulators
-        mse_sum = 0.0
-        pix_sum = 0.0
+        mse_udf_sum  = 0.0
+        mse_disp_sum = 0.0
+        pix_udf_sum  = 0.0
+        pix_disp_sum = 0.0
 
         # Where to save predictions for this eval pass
         save_root = Path(f"{args.name}_evalpreds") / f"step_{step:08d}"
@@ -549,45 +585,44 @@ def main():
         global_idx = 0
 
         for batch in tqdm(val_dl, leave=False, disable=not accelerator.is_main_process):
-            # Dataset returns ((field, aug_vec_9, img_rgb), label)
-            reals, _, aug_cond = batch[image_key]      # reals: (N,1,H,W) in training scale; aug_cond: (N,3,H,W)
-
-            # Sample from noise with EMA model, conditioned on RGB
+            reals, _, aug_cond, _disp_gt = batch[image_key]  # reals: (N,2,H,W)
             x = torch.randn_like(reals) * sigma_max
             x_pred = K.sampling.sample_dpmpp_2m_sde(
                 model_ema, x, sigmas,
                 extra_args={"aug_cond": aug_cond},
                 eta=0.0, solver_type="heun", disable=True
-            )  # (N,1,H,W)
+            )  # (N,2,H,W)
 
-            # ---- MSE (in the SAME scale as training targets) ----
-            se = (x_pred - reals).pow(2).sum()                          # sum, not mean
-            se = accelerator.gather(se).sum().item()                    # scalar
-            npx = accelerator.gather(torch.tensor([reals.numel()], 
-                    device=device, dtype=torch.float32)).sum().item()
+            # channelwise squared error sums
+            se_udf  = (x_pred[:,0] - reals[:,0]).pow(2).sum()
+            se_disp = (x_pred[:,1] - reals[:,1]).pow(2).sum()
+            npx_udf  = torch.tensor([reals[:,0].numel()], device=device, dtype=torch.float32)
+            npx_disp = torch.tensor([reals[:,1].numel()], device=device, dtype=torch.float32)
 
-            mse_sum += se
-            pix_sum += npx
+            # gather across ranks
+            mse_udf_sum  += accelerator.gather(se_udf).sum().item()
+            mse_disp_sum += accelerator.gather(se_disp).sum().item()
+            pix_udf_sum  += accelerator.gather(npx_udf).sum().item()
+            pix_disp_sum += accelerator.gather(npx_disp).sum().item()
 
-            # ---- Save predictions as .npy on rank 0 ----
+            # optional: save predictions
             if accelerator.is_main_process:
                 N = x_pred.size(0)
                 for i in range(N):
-                    pred = x_pred[i, 0].detach().cpu().float().numpy()   # (H,W) in training scale
-                    # Optionally unscale to pixel units if you trained with u_scale
-                    if u_scale is not None and u_scale > 0:
-                        pred_to_save = pred * float(u_scale)
-                    else:
-                        pred_to_save = pred
-
-                    np.save(save_root / f"val_{global_idx:06d}_pred_udf.npy", pred_to_save.astype(np.float32))
+                    pred_np = x_pred[i].permute(1,2,0).detach().cpu().numpy().astype(np.float32)  # (H,W,2)
+                    np.save(save_root / f"val_{global_idx:06d}_pred_field.npy", pred_np)
                     global_idx += 1
 
-        mse_mean = mse_sum / pix_sum
+        mse_udf  = mse_udf_sum  / max(1.0, pix_udf_sum)
+        mse_disp = mse_disp_sum / max(1.0, pix_disp_sum)
+
         if accelerator.is_main_process:
-            tqdm.write(f"Val MSE: {mse_mean:.10f}  (saved preds to: {save_root})")
+            tqdm.write(f"Val MSE UDF: {mse_udf:.6g} | Val MSE DISP(px): {mse_disp:.6g}  (saved preds to: {save_root})")
             if use_wandb:
-                wandb.log({"val/mse": mse_mean}, step=step)
+                wandb.log({
+                    "val/mse_udf": mse_udf,
+                    "val/mse_disp": mse_disp
+                }, step=step)
 
 
 
@@ -640,7 +675,11 @@ def main():
 
                 with accelerator.accumulate(model):
                     # pdb.set_trace()
-                    reals, _, aug_cond = batch[image_key]
+                    # Stereo payload: (x2, aug_vec_9, cond6, disp_gt)
+                    # x2 = [UDF_norm, DISP_px]
+                    reals, _, aug_cond, disp_gt = batch[image_key]      # shapes: (N,2,H,W), (N,6,H,W), (N,1,H,W)
+
+
                     class_cond, extra_args = None, {}
                     if num_classes:
                         class_cond = batch[class_key]
@@ -650,11 +689,15 @@ def main():
                     noise = torch.randn_like(reals)
                     with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
                         sigma = sample_density([reals.shape[0]], device=device)
+
+                    # --- Base diffusion loss (per-sample), mean over batch (this is the ONLY term backprop'd) ---
                     with K.models.checkpointing(args.checkpointing):
-                        losses = model.loss(reals, noise, sigma, aug_cond=aug_cond, **extra_args)
-                    loss = accelerator.gather(losses).mean().item()
-                    losses_since_last_print.append(loss)
-                    accelerator.backward(losses.mean())
+                        base_losses = model.loss(reals, noise, sigma, aug_cond=aug_cond, **extra_args)  # (N,)
+                    base_loss_mean = base_losses.mean()
+
+                    # --- Backprop ONLY base loss ---
+                    accelerator.backward(base_loss_mean)
+
                     if args.gns:
                         sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
                         gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, reals.shape[0], reals.shape[0] * accelerator.num_processes)
@@ -664,8 +707,40 @@ def main():
                     sched.step()
                     opt.zero_grad()
 
+                    # ================== MONITORING (no grad) ==================
+                    # Use SAME sigma/noise so it's comparable; compute channel MSEs purely for logging
+                    with torch.no_grad():
+                        sigma_  = sigma.view(-1, 1, 1, 1)                  # (N,1,1,1)
+                        x_noisy = reals + noise * sigma_                   # (N,2,H,W)
+                        x_pred  = model(x_noisy, sigma, aug_cond=aug_cond, **extra_args)  # (N,2,H,W)
+
+                        mse_udf  = ((x_pred[:, 0] - reals[:, 0])**2).mean()
+                        mse_disp = ((x_pred[:, 1] - reals[:, 1])**2).mean()
+
+                    # Gather for logging across ranks
+                    base_loss_item = accelerator.gather(base_losses.detach()).float().mean().item()
+                    udf_mse_item   = accelerator.gather(mse_udf).float().mean().item()
+                    disp_mse_item  = accelerator.gather(mse_disp).float().mean().item()
+                    
+                    if args.gns:
+                        sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
+                        gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, reals.shape[0], reals.shape[0] * accelerator.num_processes)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.)
+                    opt.step()
+                    sched.step()
+                    opt.zero_grad()
+
+
+                    # --- Logging scalars for EMA/wandb ---
+                    base_loss_item = accelerator.gather(base_losses.detach()).float().mean().item()
+                    udf_mse_item   = accelerator.gather(mse_udf.detach()).float().mean().item()
+                    disp_mse_item  = accelerator.gather(mse_disp.detach()).float().mean().item()
+                    total_loss_item = base_loss_item + float(args.udf_lambda) * udf_mse_item + float(args.disp_lambda) * disp_mse_item
+                    losses_since_last_print.append(total_loss_item)
+
                     ema_decay = ema_sched.get_value()
-                    K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
+                    K.utils.ema_update_dict(ema_stats, {'loss': base_loss_item}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
                         K.utils.ema_update(model, model_ema, ema_decay)
                         ema_sched.step()
@@ -690,14 +765,15 @@ def main():
                 if use_wandb:
                     log_dict = {
                         'epoch': epoch,
-                        'loss': loss,
+                        'loss/base_diffusion': base_loss_item,  # the one being optimized
+                        'monitor/udf_mse': udf_mse_item,        # monitor only
+                        'monitor/disp_mse': disp_mse_item,      # monitor only
                         'lr': sched.get_last_lr()[0],
                         'ema_decay': ema_decay,
                     }
                     if args.gns:
                         log_dict['gradient_noise_scale'] = gns_stats.get_gns()
                     wandb.log(log_dict, step=step)
-
                 step += 1
 
                 if step % args.demo_every == 0:

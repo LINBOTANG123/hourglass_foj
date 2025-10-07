@@ -20,4 +20,6 @@ wandb/*
 /eval*/
 /old_trainings/
 /udf_diffusion_imgtok_weights/
-
+/udf_diffusion_imgtok_has_samecolor/
+/udf_diffusion_imgtok_newloss/
+/archived/

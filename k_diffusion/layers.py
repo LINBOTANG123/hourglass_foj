@@ -45,11 +45,17 @@ def freq_weight_nd(shape, scales=0, dtype=None, device=None):
 class Denoiser(nn.Module):
     """A Karras et al. preconditioner for denoising diffusion models."""
 
-    def __init__(self, inner_model, sigma_data=1., weighting='karras', scales=1):
+    def __init__(self, inner_model, sigma_data=1., weighting='karras', scales=1, channel_scales=None):
         super().__init__()
         self.inner_model = inner_model
         self.sigma_data = sigma_data
         self.scales = scales
+        # Optional per-channel loss multipliers (e.g., [1.0, 1/64] for UDF/DISP)
+        # Store as a simple tuple; we’ll materialize a tensor on the right device/dtype in forward().
+        if isinstance(channel_scales, list):
+            channel_scales = tuple(channel_scales)
+        self.channel_scales = channel_scales
+
         if callable(weighting):
             self.weighting = weighting
         if weighting == 'karras':
@@ -81,7 +87,18 @@ class Denoiser(nn.Module):
         target = (input - c_skip * noised_input) / c_out
         if self.scales == 1:
             return ((model_output - target) ** 2).flatten(1).mean(1) * c_weight
-        sq_error = dct(model_output - target) ** 2
+        # sq_error = dct(model_output - target) ** 2
+        sq_error = (model_output - target) ** 2     # shape: (N, C, H, W)
+
+        # ----- NEW: optional per-channel scaling BEFORE frequency/SNR weighting -----
+        if self.channel_scales is not None:
+            # Make a [1, C, 1, 1] tensor; validate length matches channel count.
+            cs = torch.as_tensor(self.channel_scales, dtype=sq_error.dtype, device=sq_error.device)
+            if cs.numel() != sq_error.shape[1]:
+                raise ValueError(f"channel_scales has length {cs.numel()}, "
+                                 f"but loss got {sq_error.shape[1]} channels.")
+            sq_error = sq_error * cs.view(1, -1, 1, 1)
+            
         f_weight = freq_weight_nd(sq_error.shape[2:], self.scales, dtype=sq_error.dtype, device=sq_error.device)
         return (sq_error * f_weight).flatten(1).mean(1) * c_weight
 
